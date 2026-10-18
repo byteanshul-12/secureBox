@@ -32,6 +32,7 @@ The app runs at http://localhost:3000. A single Express server ([server.ts](serv
 | Variable               | Description                                                                          |
 | ---------------------- | ------------------------------------------------------------------------------------ |
 | `GEMINI_API_KEY`       | Required. Used server-side for all Gemini calls.                                     |
+| `GEMINI_MODEL`         | Optional. Model used for scanning (default `gemini-3.5-flash`).                      |
 | `BETTER_AUTH_SECRET`   | Required. Session signing secret (`openssl rand -base64 32`).                        |
 | `BETTER_AUTH_URL`      | App URL, default `http://localhost:3000`.                                            |
 | `GOOGLE_CLIENT_ID`     | Optional. With the secret, enables "Continue with Google" and real Gmail scanning.   |

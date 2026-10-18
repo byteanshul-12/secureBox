@@ -37,6 +37,8 @@ export const auth = betterAuth({
       prompt: "select_account consent",
     },
   },
+  // Lets "Continue with Google" attach to an existing email/password account with the same email
+  account: { accountLinking: { enabled: true, trustedProviders: ["google"] } },
   user: {
     additionalFields: {
       protectionLevel: { type: "string", defaultValue: "balanced", input: false },

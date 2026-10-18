@@ -24,6 +24,9 @@ export default function Dashboard({
   // UI and syncing states
   const [isSyncing, setIsSyncing] = useState(false);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [syncProgress, setSyncProgress] = useState(0);
+  const [filter, setFilter] = useState<"all" | "spam" | "safe">("all");
+  const [visibleCount, setVisibleCount] = useState(50);
   const [selectedMail, setSelectedMail] = useState<ScannedEmail | null>(null);
   const [activeTab, setActiveTab] = useState<"inbox" | "rules" | "logs">("inbox");
 
@@ -79,9 +82,17 @@ export default function Dashboard({
     setIsSyncing(true);
     setSyncError(null);
 
+    setSyncProgress(0);
     try {
-      await api("/gmail/sync", { method: "POST" });
-      await loadAll();
+      // Each call scans a batch of new emails; keep going until the whole inbox is covered
+      let total = 0;
+      for (let round = 0; round < 100; round++) {
+        const out = await api("/gmail/sync", { method: "POST" });
+        total += out.scanned;
+        setSyncProgress(total);
+        await loadAll();
+        if (!out.remaining || out.scanned === 0) break;
+      }
     } catch (err: any) {
       console.error("Sync error:", err);
       setSyncError(err.message || "Threat scanning interface is currently busy.");
@@ -159,6 +170,12 @@ export default function Dashboard({
     name: mail.date ? mail.date.substring(5, 10) : `Item ${idx + 1}`,
     threat: Math.max(mail.threatScore, mail.phishingScore, mail.spamScore)
   }));
+
+  const isSpamLike = (m: ScannedEmail) =>
+    ["Spam", "Phishing", "Scam", "Suspicious"].includes(m.classification) ||
+    m.riskLevel === "High Risk" || m.riskLevel === "Critical";
+  const spamCount = emails.filter(isSpamLike).length;
+  const filteredEmails = emails.filter(m => filter === "all" || (filter === "spam" ? isSpamLike(m) : !isSpamLike(m)));
 
   // Statistics calculation helpers
   const totalScannedCount = emails.length;
@@ -296,7 +313,7 @@ export default function Dashboard({
               }`}
             >
               <RefreshCw className={`w-4.5 h-4.5 stroke-[2.5] ${isSyncing ? "animate-spin" : ""}`} />
-              {isSyncing ? "Scanning Inbox..." : "Sync & Scan Gmail"}
+              {isSyncing ? `Scanning... ${syncProgress} emails` : "Sync & Scan Gmail"}
             </button>
           </div>
         </header>
@@ -432,6 +449,23 @@ export default function Dashboard({
               <div className="space-y-4">
                 <div className="flex items-center justify-between">
                   <h3 className="font-display font-black text-lg text-slate-950">Scanned Inbox Items</h3>
+                  <div className="flex gap-1.5">
+                    {([
+                      ["all", `All (${emails.length})`],
+                      ["spam", `Spam & threats (${spamCount})`],
+                      ["safe", `Safe (${emails.length - spamCount})`],
+                    ] as const).map(([key, label]) => (
+                      <button
+                        key={key}
+                        onClick={() => { setFilter(key); setVisibleCount(50); }}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-black border-2 border-black cursor-pointer ${
+                          filter === key ? "bg-[#4F8CFF] text-white" : "bg-white text-slate-800 hover:bg-slate-50"
+                        }`}
+                      >
+                        {label}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
                 {emails.length === 0 ? (
@@ -444,7 +478,7 @@ export default function Dashboard({
                   </div>
                 ) : (
                   <div id="scanned-emails-container" className="space-y-4">
-                    {emails.map((mail) => {
+                    {filteredEmails.slice(0, visibleCount).map((mail) => {
                       const maxScore = Math.max(mail.threatScore, mail.phishingScore, mail.spamScore);
                       let riskColor = "bg-emerald-100 border border-emerald-300 text-emerald-950";
                       if (mail.riskLevel === "Low Risk") riskColor = "bg-blue-100 border border-blue-300 text-blue-950";
@@ -489,6 +523,17 @@ export default function Dashboard({
                         </div>
                       );
                     })}
+                    {filteredEmails.length > visibleCount && (
+                      <button
+                        onClick={() => setVisibleCount(c => c + 50)}
+                        className="w-full py-2.5 text-xs font-black border-2 border-black rounded-lg bg-white hover:bg-slate-50 cursor-pointer"
+                      >
+                        Show more ({filteredEmails.length - visibleCount} left)
+                      </button>
+                    )}
+                    {filteredEmails.length === 0 && (
+                      <p className="text-center text-xs font-bold text-slate-600 py-6">No emails match this filter.</p>
+                    )}
                   </div>
                 )}
               </div>

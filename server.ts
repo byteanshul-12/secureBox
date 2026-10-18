@@ -10,6 +10,8 @@ import { api, requireUser, getGoogleToken, logActivity } from "./server/api.ts";
 const geminiError = (error: any, fallback: string) =>
   error?.status === 401 || error?.status === 403
     ? "Gemini rejected GEMINI_API_KEY. Create a key at https://aistudio.google.com/apikey and set it in .env."
+    : error?.status === 429
+    ? "Gemini quota exceeded (the free tier allows ~20 requests/day per model). Wait for the reset, enable billing, or set GEMINI_MODEL in .env to another model."
     : fallback;
 
 const RISK_LEVELS = ["Safe", "Low Risk", "Medium Risk", "High Risk", "Critical"];
@@ -45,17 +47,83 @@ function normalizeClass(value: unknown, riskLevel: string): string {
   return "Personal";
 }
 
-// Retry transient Gemini failures (overloaded / rate limited) with exponential backoff
+// Retry transient Gemini failures (overloaded) with exponential backoff
 async function generate(params: Parameters<typeof ai.models.generateContent>[0], attempts = 4) {
   for (let i = 0; ; i++) {
     try {
       return await ai.models.generateContent(params);
     } catch (err: any) {
-      const transient = [429, 500, 503, 504].includes(err?.status);
+      const transient = [500, 503, 504].includes(err?.status);
       if (!transient || i >= attempts - 1) throw err;
       await new Promise((r) => setTimeout(r, 1000 * 2 ** i));
     }
   }
+}
+
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.5-flash";
+const SYNC_BATCH = 40; // new emails processed per /api/gmail/sync call; the client loops until done
+const SCAN_CHUNK = 10; // emails per Gemini request
+
+async function mapPool<T, R>(items: T[], size: number, fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out: R[] = new Array(items.length);
+  let next = 0;
+  await Promise.all(
+    Array.from({ length: Math.min(size, items.length) }, async () => {
+      while (next < items.length) {
+        const i = next++;
+        out[i] = await fn(items[i]);
+      }
+    })
+  );
+  return out;
+}
+
+type MailItem = { id: string; from: string; to: string; subject: string; date: string; snippet: string; bodyText: string };
+
+/** Scans emails SCAN_CHUNK at a time and returns results keyed by email id. Emails that fail are left out so the next sync retries them. */
+async function scanEmails(items: MailItem[]): Promise<Map<string, any>> {
+  const chunks: MailItem[][] = [];
+  for (let i = 0; i < items.length; i += SCAN_CHUNK) chunks.push(items.slice(i, i + SCAN_CHUNK));
+  const results = new Map<string, any>();
+
+  await mapPool(chunks, 3, async (chunk) => {
+    const listing = chunk
+      .map((m) => `### EMAIL id=${m.id}\nFrom: ${m.from}\nTo: ${m.to}\nSubject: ${m.subject}\nDate: ${m.date}\nContent:\n${(m.bodyText || m.snippet).slice(0, 1500)}`)
+      .join("\n\n");
+    try {
+      const response = await generate({
+        model: GEMINI_MODEL,
+        contents: `Analyze each email below for spam, phishing, scams and malicious intent. Decide for every email whether it is spam or legitimate. Return one result per email, echoing its id exactly.\n\n${listing}`,
+        config: {
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.ARRAY,
+            items: {
+              type: Type.OBJECT,
+              properties: {
+                id: { type: Type.STRING },
+                spamScore: { type: Type.INTEGER, description: "0-100" },
+                phishingScore: { type: Type.INTEGER, description: "0-100" },
+                threatScore: { type: Type.INTEGER, description: "0-100" },
+                confidenceScore: { type: Type.INTEGER, description: "0-100" },
+                riskLevel: { type: Type.STRING, enum: RISK_LEVELS },
+                classification: { type: Type.STRING, enum: CLASSIFICATIONS },
+                explanation: { type: Type.STRING },
+                riskFactors: { type: Type.ARRAY, items: { type: Type.STRING } },
+                recommendedAction: { type: Type.STRING },
+              },
+              required: ["id", "spamScore", "phishingScore", "threatScore", "confidenceScore", "riskLevel", "classification", "explanation", "riskFactors", "recommendedAction"],
+            },
+          },
+        },
+      });
+      for (const r of JSON.parse(response.text.trim())) results.set(String(r.id), r);
+    } catch (err: any) {
+      if (err?.status === 401 || err?.status === 403 || err?.status === 429) throw err;
+      console.warn(`Skipping ${chunk.length} emails: Gemini scan failed (${err?.status || err?.message})`);
+    }
+  });
+  return results;
 }
 
 const app = express();
@@ -104,7 +172,7 @@ ${content}
 You must return a rigorous security risk assessment strictly matching the JSON schema.`;
 
     const result = await generate({
-      model: "gemini-3.5-flash",
+      model: GEMINI_MODEL,
       contents: analysisPrompt,
       config: {
         responseMimeType: "application/json",
@@ -203,31 +271,39 @@ app.post("/api/gmail/sync", requireUser, async (req, res) => {
   ];
 
   let messages: any[] = [];
+  let hasMore = false;
   let isSimulated = !googleAccessToken;
+  const isScanned = db.prepare("SELECT 1 FROM emails WHERE userId = ? AND id = ?");
+  const alreadyScanned = (id: string) => Boolean(isScanned.get(userId, id));
 
   if (!isSimulated) {
     try {
-      // 1. Fetch latest emails from Google Gmail API
-      const listUrl = "https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=8";
-      const gmailListRes = await fetch(listUrl, {
-        headers: { Authorization: `Bearer ${googleAccessToken}` },
-      });
-
-      if (gmailListRes.ok) {
+      // Page through the inbox (newest first), collecting messages not scanned yet
+      let pageToken: string | undefined;
+      do {
+        const listUrl = new URL("https://gmail.googleapis.com/gmail/v1/users/me/messages");
+        listUrl.searchParams.set("maxResults", "100");
+        listUrl.searchParams.set("labelIds", "INBOX");
+        if (pageToken) listUrl.searchParams.set("pageToken", pageToken);
+        const gmailListRes = await fetch(listUrl, { headers: { Authorization: `Bearer ${googleAccessToken}` } });
+        if (!gmailListRes.ok) throw new Error(`Gmail list failed (${gmailListRes.status})`);
         const listData = await gmailListRes.json();
-        messages = listData.messages || [];
-      } else {
-        console.warn("Gmail API listing failure, falling back to simulated sandbox feed.");
-        isSimulated = true;
-      }
+        for (const m of listData.messages || []) {
+          if (alreadyScanned(m.id)) continue;
+          if (messages.length >= SYNC_BATCH) hasMore = true;
+          else messages.push(m);
+        }
+        pageToken = hasMore ? undefined : listData.nextPageToken;
+      } while (pageToken);
     } catch (err) {
-      console.warn("Gmail API connection error, falling back to simulated sandbox feed:", err);
+      console.warn("Gmail API error, falling back to simulated sandbox feed:", err);
       isSimulated = true;
+      messages = [];
     }
   }
 
   if (isSimulated) {
-    messages = simulatedMails.map(m => ({ id: m.id }));
+    messages = simulatedMails.filter(m => !alreadyScanned(m.id)).map(m => ({ id: m.id }));
   }
 
   try {
@@ -280,102 +356,41 @@ app.post("/api/gmail/sync", requireUser, async (req, res) => {
       }
     }
 
-    for (const msg of messages) {
-      const cached = db.prepare("SELECT data FROM emails WHERE userId = ? AND id = ?").get(userId, msg.id) as { data: string } | undefined;
-      if (cached) {
-        // Already scanned and stored
-        scannedReports.push(JSON.parse(cached.data));
-        continue;
-      }
-
-      let fromHeader = "";
-      let toHeader = "";
-      let subjectHeader = "";
-      let dateHeader = "";
-      let snippet = "";
-      let bodyText = "";
-
+    // Load every new message's content (10 at a time), then scan them in batches
+    const loaded = await mapPool(messages, 10, async (msg): Promise<MailItem | null> => {
       if (isSimulated) {
-        const matchingMail = simulatedMails.find(m => m.id === msg.id);
-        if (!matchingMail) continue;
-        fromHeader = matchingMail.from;
-        toHeader = matchingMail.to;
-        subjectHeader = matchingMail.subject;
-        dateHeader = matchingMail.date;
-        snippet = matchingMail.snippet;
-        bodyText = matchingMail.body;
-      } else {
-        // Fetch detail message
-        const detailUrl = `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`;
-        const msgRes = await fetch(detailUrl, {
+        const m = simulatedMails.find(x => x.id === msg.id);
+        return m ? { id: m.id, from: m.from, to: m.to, subject: m.subject, date: m.date, snippet: m.snippet, bodyText: m.body } : null;
+      }
+      try {
+        const msgRes = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=full`, {
           headers: { Authorization: `Bearer ${googleAccessToken}` },
         });
-
-        if (!msgRes.ok) continue;
+        if (!msgRes.ok) return null;
         const msgData = await msgRes.json();
-
         const headers = msgData.payload?.headers || [];
-        fromHeader = getHeader(headers, "From");
-        toHeader = getHeader(headers, "To");
-        subjectHeader = getHeader(headers, "Subject") || "(No Subject)";
-        dateHeader = getHeader(headers, "Date");
-        snippet = msgData.snippet || "";
-        bodyText = getBodyContent(msgData.payload) || snippet;
+        const snippet = msgData.snippet || "";
+        return {
+          id: msg.id,
+          from: getHeader(headers, "From"),
+          to: getHeader(headers, "To"),
+          subject: getHeader(headers, "Subject") || "(No Subject)",
+          date: getHeader(headers, "Date"),
+          snippet,
+          bodyText: getBodyContent(msgData.payload) || snippet,
+        };
+      } catch {
+        return null;
       }
+    });
+    const items = loaded.filter((m): m is MailItem => m !== null);
+    const scanResults = await scanEmails(items);
 
-      // Ask Gemini to scan this particular email body
-      const riskPrompt = `Please analyze the security and safety posture of this email inbox item:
-From: ${fromHeader}
-To: ${toHeader}
-Subject: ${subjectHeader}
-Date: ${dateHeader}
-Snippet: ${snippet}
-Message content:
-${bodyText}
-
-Produce a complete audit report strictly matching the JSON schema requested.`;
-
-      let aiResponse;
-      try {
-        aiResponse = await generate({
-        model: "gemini-3.5-flash",
-        contents: riskPrompt,
-        config: {
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              spamScore: { type: Type.INTEGER },
-              phishingScore: { type: Type.INTEGER },
-              threatScore: { type: Type.INTEGER },
-              confidenceScore: { type: Type.INTEGER },
-              riskLevel: { type: Type.STRING, enum: RISK_LEVELS },
-              classification: { type: Type.STRING, enum: CLASSIFICATIONS },
-              explanation: { type: Type.STRING },
-              riskFactors: { type: Type.ARRAY, items: { type: Type.STRING } },
-              recommendedAction: { type: Type.STRING },
-            },
-            required: [
-              "spamScore",
-              "phishingScore",
-              "threatScore",
-              "confidenceScore",
-              "riskLevel",
-              "classification",
-              "explanation",
-              "riskFactors",
-              "recommendedAction",
-            ],
-          },
-        },
-      });
-      } catch (err: any) {
-        if (err?.status === 401 || err?.status === 403) throw err;
-        console.warn(`Skipping message ${msg.id}: Gemini scan failed (${err?.status || err?.message})`);
-        continue;
-      }
-
-      const securityResult = JSON.parse(aiResponse.text.trim());
+    for (const item of items) {
+      const msg = { id: item.id };
+      const { from: fromHeader, to: toHeader, subject: subjectHeader, date: dateHeader, snippet } = item;
+      const securityResult = scanResults.get(item.id);
+      if (!securityResult) continue; // scan failed; picked up again on the next sync
       securityResult.riskLevel = normalizeRisk(securityResult.riskLevel, Math.max(securityResult.threatScore ?? 0, securityResult.phishingScore ?? 0));
       securityResult.classification = normalizeClass(securityResult.classification, securityResult.riskLevel);
       const classKey = securityResult.classification?.toLowerCase() || "";
@@ -517,7 +532,7 @@ Produce a complete audit report strictly matching the JSON schema requested.`;
       scannedReports.push(docPayload);
     }
 
-    res.json({ success: true, reports: scannedReports });
+    res.json({ success: true, scanned: scannedReports.length, remaining: hasMore || (scannedReports.length < messages.length && messages.length > 0), reports: scannedReports });
   } catch (error: any) {
     console.error("Gmail sync error:", error);
     res.status(500).json({ error: geminiError(error, "Failed to securely parse and sync Gmail messages with Gemini AI.") });
