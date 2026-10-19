@@ -278,6 +278,13 @@ export default function Dashboard({
               <Info className="w-4.5 h-4.5 text-[#4F8CFF] stroke-[2.5]" />
               Manual Cold Sandbox
             </button>
+            <button
+              onClick={() => onPageChange("url-scanner")}
+              className="w-full py-3 px-4 bg-[#E8F4FF] hover:bg-[#cce8ff] text-slate-900 rounded-xl text-xs font-display font-black text-left flex items-center gap-2.5 border-2 border-black shadow-[3px_3px_0px_0px_rgba(0,0,0,1)] hover:-translate-x-0.5 hover:-translate-y-0.5 hover:shadow-[4.5px_4.5px_0px_0px_rgba(0,0,0,1)] active:translate-x-0 active:translate-y-0 transition-all cursor-pointer"
+            >
+              <Zap className="w-4.5 h-4.5 text-[#4F8CFF] stroke-[2.5]" />
+              URL &amp; SMS Scanner
+            </button>
           </nav>
         </div>
 
