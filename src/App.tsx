@@ -7,6 +7,7 @@ import { UserProfile } from "./types.ts";
 import LandingPage from "./components/LandingPage.tsx";
 import Dashboard from "./components/Dashboard.tsx";
 import EmailScanner from "./components/EmailScanner.tsx";
+import URLScanner from "./components/URLScanner.tsx";
 import AuthModal from "./components/AuthModal.tsx";
 
 export default function App() {
@@ -104,6 +105,18 @@ export default function App() {
             transition={{ duration: 0.3 }}
           >
             <EmailScanner onBackToDashboard={() => setCurrentPage("dashboard")} />
+          </motion.div>
+        )}
+
+        {currentPage === "url-scanner" && (
+          <motion.div
+            key="url-scanner-view"
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            transition={{ duration: 0.3 }}
+          >
+            <URLScanner onBackToDashboard={() => setCurrentPage("dashboard")} />
           </motion.div>
         )}
       </AnimatePresence>

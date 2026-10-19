@@ -153,7 +153,137 @@ app.get("/api/health", (req, res) => {
 app.use("/api", api);
 
 /**
- * 3. MANUAL COLD TEXT SCANNER
+ * 3. URL FEATURE ANALYSIS + AI SCANNER
+ */
+function extractURLFeatures(rawUrl: string) {
+  let parsed: URL | null = null;
+  try { parsed = new URL(rawUrl.startsWith("http") ? rawUrl : `http://${rawUrl}`); } catch { /* invalid URL */ }
+
+  const domain = parsed?.hostname || rawUrl;
+  const tld = domain.split(".").slice(-1)[0] || "";
+  const parts = domain.split(".");
+  const subdomainCount = Math.max(0, parts.length - 2);
+  const pathDepth = parsed ? parsed.pathname.split("/").filter(Boolean).length : 0;
+  const hasHttps = rawUrl.startsWith("https");
+  const hasIPAddress = /^(\d{1,3}\.){3}\d{1,3}$/.test(domain);
+  const hasPort = Boolean(parsed?.port);
+  const hasEncodedChars = /%[0-9a-fA-F]{2}/.test(rawUrl);
+  const urlLength = rawUrl.length;
+  const SUSPICIOUS_KEYWORDS = ["login", "verify", "secure", "update", "account", "billing", "confirm", "suspend", "alert", "unlock", "validate", "bank", "paypal", "netflix", "amazon", "support", "token", "invoice", "prize", "claim", "free"];
+  const suspiciousKeywords = SUSPICIOUS_KEYWORDS.filter(kw => rawUrl.toLowerCase().includes(kw));
+  const SUSPICIOUS_TLDS = ["xyz", "info", "top", "click", "loan", "gq", "cf", "tk", "ml", "ga", "work", "online"];
+  const suspiciousTLD = SUSPICIOUS_TLDS.includes(tld.toLowerCase());
+
+  return { domain, tld, hasHttps, subdomainCount, pathDepth, hasIPAddress, hasPort, hasEncodedChars, urlLength, suspiciousKeywords, suspiciousTLD };
+}
+
+app.post("/api/scan/url", requireUser, async (req, res) => {
+  const { url } = req.body;
+  if (!url || typeof url !== "string" || url.trim().length < 4) {
+    return res.status(400).json({ error: "A valid URL is required." });
+  }
+
+  const features = extractURLFeatures(url.trim());
+
+  const featureSummary = [
+    `URL: ${url}`,
+    `Domain: ${features.domain}`,
+    `TLD: .${features.tld} (${features.suspiciousTLD ? "HIGH RISK TLD" : "normal TLD"})`,
+    `HTTPS: ${features.hasHttps ? "Yes" : "No – HTTP only"}`,
+    `Subdomains: ${features.subdomainCount}`,
+    `Path depth: ${features.pathDepth}`,
+    `URL length: ${features.urlLength} characters`,
+    `IP address as hostname: ${features.hasIPAddress ? "YES – SUSPICIOUS" : "No"}`,
+    `Custom port in URL: ${features.hasPort ? "YES – SUSPICIOUS" : "No"}`,
+    `Percent-encoded characters: ${features.hasEncodedChars ? "YES – SUSPICIOUS" : "No"}`,
+    `Suspicious keywords detected: ${features.suspiciousKeywords.length > 0 ? features.suspiciousKeywords.join(", ") : "None"}`,
+  ].join("\n");
+
+  try {
+    const result = await generate({
+      model: GEMINI_MODEL,
+      contents: `Analyze this URL for phishing, malware, or social-engineering risk.\n\nEXTRACTED FEATURES:\n${featureSummary}\n\nBased on these structural features and your knowledge of malicious URL patterns, provide a detailed risk assessment.`,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            isMalicious:     { type: Type.BOOLEAN },
+            riskScore:       { type: Type.INTEGER, description: "0-100 overall risk score" },
+            confidenceScore: { type: Type.INTEGER, description: "0-100" },
+            riskLevel:       { type: Type.STRING, enum: RISK_LEVELS },
+            explanation:     { type: Type.STRING },
+            riskFactors:     { type: Type.ARRAY, items: { type: Type.STRING } },
+            recommendedAction: { type: Type.STRING },
+          },
+          required: ["isMalicious", "riskScore", "confidenceScore", "riskLevel", "explanation", "riskFactors", "recommendedAction"],
+        },
+      },
+    });
+
+    const parsed = JSON.parse(result.text.trim());
+    parsed.riskLevel = normalizeRisk(parsed.riskLevel, parsed.riskScore ?? 0);
+    res.json({
+      success: true,
+      result: {
+        url: url.trim(),
+        ...parsed,
+        urlFeatures: features,
+      },
+    });
+  } catch (error: any) {
+    console.error("URL scan error:", error);
+    res.status(500).json({ error: geminiError(error, "URL analysis failed. Please try again.") });
+  }
+});
+
+/**
+ * 4. SMS / SMISHING SCANNER
+ */
+app.post("/api/scan/sms", requireUser, async (req, res) => {
+  const { sender, content } = req.body;
+  if (!sender || !content) {
+    return res.status(400).json({ error: "Sender and Content are required." });
+  }
+
+  try {
+    const analysisPrompt = `Analyze this SMS message for smishing (SMS phishing), scam, spam, or social-engineering threats.\nSender: ${sender}\nSMS Content:\n${content}\n\nReturn a rigorous security risk assessment.`;
+
+    const result = await generate({
+      model: GEMINI_MODEL,
+      contents: analysisPrompt,
+      config: {
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            spamScore:       { type: Type.INTEGER, description: "0-100" },
+            phishingScore:   { type: Type.INTEGER, description: "0-100" },
+            threatScore:     { type: Type.INTEGER, description: "0-100" },
+            confidenceScore: { type: Type.INTEGER, description: "0-100" },
+            riskLevel:       { type: Type.STRING, enum: RISK_LEVELS },
+            classification:  { type: Type.STRING, enum: CLASSIFICATIONS },
+            explanation:     { type: Type.STRING },
+            riskFactors:     { type: Type.ARRAY, items: { type: Type.STRING } },
+            recommendedAction: { type: Type.STRING },
+          },
+          required: ["spamScore", "phishingScore", "threatScore", "confidenceScore", "riskLevel", "classification", "explanation", "riskFactors", "recommendedAction"],
+        },
+      },
+    });
+
+    const parsedResponse = JSON.parse(result.text.trim());
+    parsedResponse.riskLevel = normalizeRisk(parsedResponse.riskLevel, Math.max(parsedResponse.threatScore ?? 0, parsedResponse.phishingScore ?? 0));
+    parsedResponse.classification = normalizeClass(parsedResponse.classification, parsedResponse.riskLevel);
+    res.json({ success: true, results: parsedResponse });
+  } catch (error: any) {
+    console.error("SMS scan error:", error);
+    res.status(500).json({ error: geminiError(error, "SMS analysis failed. Please try again.") });
+  }
+});
+
+/**
+ * 5. MANUAL COLD TEXT SCANNER
  */
 app.post("/api/scan/manual", requireUser, async (req, res) => {
   const { sender, subject, content } = req.body;
